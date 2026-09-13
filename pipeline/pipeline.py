@@ -91,7 +91,6 @@ def transform(raw, scan_date, hubs, couriers, customers, services):
     df = raw.copy()
 
     # 1. Deduplicate identical scan events (same event sent twice)
-    initial_count = len(df)
     dup_mask = df.duplicated(subset=["scan_id"], keep="first")
     rows_deduplicated = int(dup_mask.sum())
     working = df[~dup_mask].copy()
@@ -109,13 +108,15 @@ def transform(raw, scan_date, hubs, couriers, customers, services):
     parsed_timestamps = parse_timestamps(working["scanned_at"])
 
     # 4. Repair & validate weight_kg
-    raw_weights = working["weight_kg"].fillna("").astype(str).str.strip().str.replace(",", ".", regex=False)
+    raw_weights = (
+        working["weight_kg"].fillna("").astype(str).str.strip().str.replace(",", ".", regex=False)
+    )
     numeric_weights = pd.to_numeric(raw_weights.replace("", np.nan), errors="coerce")
 
     # Evaluate validation rules and assign reject reasons
     reasons = []
-    for idx, (row, ts, wt, raw_wt) in enumerate(
-        zip(working.itertuples(index=False), parsed_timestamps, numeric_weights, raw_weights)
+    for row, ts, wt, raw_wt in zip(
+        working.itertuples(index=False), parsed_timestamps, numeric_weights, raw_weights
     ):
         reason = None
 
@@ -170,16 +171,17 @@ def transform(raw, scan_date, hubs, couriers, customers, services):
 
 
 def load(good, scan_date):
-    """Write one day idempotently."""
+    """Write one day idempotently using strict half-open date boundaries."""
     rows_loaded = len(good)
+    next_day = (pd.to_datetime(scan_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
 
     with engine.begin() as conn:
-        # Idempotency: delete any existing scans for this scan date range
+        # Idempotency: remove previous runs for this day window
         conn.execute(
             text(
-                "DELETE FROM parcel_scans WHERE scanned_at >= :start_ts AND scanned_at <= :end_ts"
+                "DELETE FROM parcel_scans WHERE scanned_at >= :start_ts AND scanned_at < :next_day_ts"
             ),
-            {"start_ts": f"{scan_date} 00:00:00", "end_ts": f"{scan_date} 23:59:59"},
+            {"start_ts": f"{scan_date} 00:00:00", "next_day_ts": f"{next_day} 00:00:00"},
         )
 
         if rows_loaded > 0:
@@ -289,7 +291,7 @@ def main(scan_date):
         rows_loaded = len(good)
         rows_rejected = len(rejects)
 
-        # Prove arithmetic: rows_read == rows_loaded + rows_rejected + rows_deduplicated
+        # Arithmetic reconciliation contract
         assert (
             rows_read == rows_loaded + rows_rejected + rows_deduplicated
         ), f"Arithmetic balance failed: {rows_read} != {rows_loaded} + {rows_rejected} + {rows_deduplicated}"

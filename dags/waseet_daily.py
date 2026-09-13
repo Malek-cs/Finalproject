@@ -1,89 +1,82 @@
-"""The daily scan DAG.
-
-A skeleton with the imports you will need and the shape of the run. Fill in the
-tasks, wire the dependencies, and delete the comments as you replace them.
-
-Inside the container the paths are:
-
-    /opt/airflow/data       the scan files and lookups
-    /opt/airflow/pipeline   pipeline.py and quality.py
-
-Iterate with `dags test`, which runs the whole DAG in one process and prints
-straight to your terminal - no unpausing, no waiting for the scheduler:
-
-    docker exec waseet-airflow airflow dags test waseet_daily 2026-05-04
-"""
-
-from datetime import timedelta
-
+from datetime import datetime, timedelta
+import os
+import pandas as pd
 from airflow import DAG
-from airflow.operators.bash import BashOperator
-from airflow.operators.python import BranchPythonOperator, PythonOperator
 from airflow.sensors.filesystem import FileSensor
-import pendulum
+from airflow.operators.python import BranchPythonOperator
+from airflow.operators.bash import BashOperator
+from airflow.operators.empty import EmptyOperator
 
-DATA = "/opt/airflow/data"
-CODE = "/opt/airflow/pipeline"
+DATA_DIR = "/opt/airflow/data"
 
-# TODO. Which failures here deserve a retry, and how many? A supplier that is
-# late is not a transient failure, and a renamed column is not one either.
+def alert_failure(context):
+    dag_id = context.get('task_instance').dag_id
+    task_id = context.get('task_instance').task_id
+    execution_date = context.get('execution_date')
+    print(f"[CRITICAL ALERT] Task {task_id} failed in DAG {dag_id} on {execution_date}!")
+
+def choose_branch(ds, **kwargs):
+    file_path = f"{DATA_DIR}/scans_{ds}.csv"
+    if not os.path.exists(file_path):
+        return "skip_day"
+    
+    # Check if empty or only headers (e.g., Eid May 15)
+    df = pd.read_csv(file_path, dtype=str)
+    if df.empty or len(df) == 0:
+        return "skip_day"
+    return "run_pipeline"
+
 default_args = {
-    "retries": 0,
-    "retry_delay": timedelta(minutes=5),
+    'owner': 'data_eng',
+    'depends_on_past': False,
+    'retries': 0,
+    'on_failure_callback': alert_failure,
 }
 
-
-def alert(context):
-    """TODO. Fires after the retries are exhausted.
-
-    Write a line an on-call engineer can route from. Which task failed matters
-    more than that something did: the sensor timing out is the supplier's
-    problem, the load failing is yours, and the two wake up different people.
-    """
-    raise NotImplementedError
-
-
-def choose_branch(ds):
-    """TODO. Return the task_id to run next.
-
-    The 15th of May is Eid. The network is closed, the file arrives with a
-    header and nothing under it, and failing that morning would be an alert on a
-    day when nothing is wrong. Everything below the branch that is not chosen
-    goes to `skipped`, which is why the task that joins the two paths back
-    together needs a trigger rule that is not the default.
-    """
-    raise NotImplementedError
-
-
 with DAG(
-    dag_id="waseet_daily",
-    start_date=pendulum.datetime(2026, 5, 1, tz="UTC"),
-    schedule="@daily",
-    catchup=False,
+    'waseet_daily',
     default_args=default_args,
-    tags=["waseet"],
+    description='Daily ingestion, transformation, and quality pipeline for Waseet',
+    schedule_interval='@daily',
+    start_date=datetime(2026, 5, 1),
+    end_date=datetime(2026, 5, 21),
+    catchup=False,
 ) as dag:
 
-    # TODO. Wait for the file rather than failing on its absence.
-    #
-    # poke_interval, timeout, and mode. The 10th of May never arrives at all, so
-    # the timeout is not hypothetical - decide what it should be and what should
-    # happen when it fires. Use mode="reschedule" and be able to say why.
+    # 30s timeout so May 10 triggers failure callback quickly
     wait_for_file = FileSensor(
-        task_id="wait_for_file",
-        filepath=DATA + "/scans_{{ ds }}.csv",
-        fs_conn_id="fs_default",
+        task_id='wait_for_file',
+        filepath=f"{DATA_DIR}/scans_{{{{ ds }}}}.csv",
+        fs_conn_id='fs_default',
         poke_interval=10,
-        timeout=60,
-        mode="reschedule",
+        timeout=30,
+        mode='reschedule',
     )
 
-    # TODO. The rest.
-    #
-    #   choose        BranchPythonOperator on choose_branch
-    #   run_pipeline  BashOperator -> cd CODE && python pipeline.py --date {{ ds }}
-    #   skip_day      the other side of the branch
-    #   run_quality   the suite, after the load, on the warehouse
-    #   finish        the join. Its trigger_rule is the thing to get right.
+    check_branch = BranchPythonOperator(
+        task_id='choose_branch',
+        python_callable=choose_branch,
+    )
 
-    wait_for_file
+    run_pipeline = BashOperator(
+        task_id='run_pipeline',
+        bash_command='python /opt/airflow/pipeline/pipeline.py {{ ds }}',
+    )
+
+    run_quality = BashOperator(
+        task_id='run_quality',
+        bash_command='python /opt/airflow/pipeline/quality.py {{ ds }}',
+    )
+
+    skip_day = EmptyOperator(
+        task_id='skip_day',
+    )
+
+    finish = EmptyOperator(
+        task_id='finish',
+        trigger_rule='none_failed_min_one_success',  # Allows successful DAG runs when skipping
+    )
+
+    wait_for_file >> check_branch
+    check_branch >> run_pipeline >> run_quality >> finish
+    check_branch >> skip_day >> finish

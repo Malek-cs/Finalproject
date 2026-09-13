@@ -25,7 +25,6 @@ DB_URL = os.environ.get(
 
 engine = create_engine(DB_URL)
 
-# Baseline schema storage for drift detection
 BASELINE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "baseline_schema.json"))
 
 # 10 declarative rules covering completeness, uniqueness, validity, range, and format
@@ -49,7 +48,6 @@ def run_check(df, rule):
     check = rule["check"]
 
     if col not in df.columns:
-        # If the column is missing completely, all rows break it
         return len(df)
 
     series = df[col]
@@ -59,7 +57,6 @@ def run_check(df, rule):
     elif check == "unique":
         bad_mask = series.duplicated(keep=False) & series.notna()
     elif check == "date_iso":
-        # Check standard ISO: YYYY-MM-DD HH:MM:SS
         bad_mask = ~series.astype(str).str.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
     elif check == "is_uppercase":
         bad_mask = series.astype(str) != series.astype(str).str.upper()
@@ -69,7 +66,6 @@ def run_check(df, rule):
     elif check == "numeric_positive":
         cleaned = series.astype(str).str.replace(",", ".", regex=False).str.strip()
         num = pd.to_numeric(cleaned.replace("", np.nan), errors="coerce")
-        # Null weight is allowed at non-terminal scans, but if populated it must be positive
         bad_mask = (series.notna()) & (series.astype(str).str.strip() != "") & ((num.isna()) | (num <= 0))
     elif check == "in_range":
         cleaned = series.astype(str).str.replace(",", ".", regex=False).str.strip()
@@ -99,15 +95,11 @@ def validate(df, suite):
 
 
 def check_schema(df, baseline_path=BASELINE_PATH):
-    """Return (missing, new) against the column list written at baseline_path."""
+    """Return (missing, new) against the pre-existing stored baseline."""
     if not os.path.exists(baseline_path):
-        # Create baseline from the current expected columns if not already initialized
-        default_cols = [
-            "scan_id", "parcel_id", "customer_id", "scanned_at",
-            "hub_id", "courier_id", "scan_type", "weight_kg", "service_code"
-        ]
-        with open(baseline_path, "w", encoding="utf-8") as f:
-            json.dump(default_cols, f, indent=2)
+        print(f"CRITICAL: Baseline schema file not found at {baseline_path}!")
+        print("Please ensure baseline_schema.json is tracked in the repository.")
+        sys.exit(1)
 
     with open(baseline_path, "r", encoding="utf-8") as f:
         baseline_cols = json.load(f)
@@ -129,6 +121,7 @@ def reconcile(scan_date, eng=engine):
             "file_rows": 0,
             "warehouse_rows": 0,
             "difference": 0,
+            "reconciled": True,
             "explanation": "File never arrived (Supplier delivery failure)"
         }
 
@@ -141,34 +134,45 @@ def reconcile(scan_date, eng=engine):
             "file_rows": 0,
             "warehouse_rows": 0,
             "difference": 0,
+            "reconciled": True,
             "explanation": "Holiday/Eid (Network closed, header-only file skipped cleanly)"
         }
 
     with eng.connect() as conn:
         res = conn.execute(
             text(
-                "SELECT count(*) FROM parcel_scans WHERE scanned_at >= :start_ts AND scanned_at <= :end_ts"
+                "SELECT count(*) FROM parcel_scans WHERE scanned_at >= :start_ts AND scanned_at < :next_day_ts"
             ),
-            {"start_ts": f"{scan_date} 00:00:00", "end_ts": f"{scan_date} 23:59:59"}
+            {
+                "start_ts": f"{scan_date} 00:00:00",
+                "next_day_ts": (pd.to_datetime(scan_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
+            }
         ).scalar()
         wh_rows = int(res) if res else 0
 
-        # Look up load_log metadata if available
         log_res = conn.execute(
             text("SELECT rows_rejected, rows_deduplicated, status, error_message FROM load_log WHERE run_date = :dt ORDER BY run_id DESC LIMIT 1"),
             {"dt": scan_date}
         ).fetchone()
 
     diff = file_rows - wh_rows
+    reconciled = False
     explanation = "Exact match"
 
     if log_res and log_res[2] == "FAILED":
         explanation = f"Run failed: {log_res[3]}"
+        reconciled = True
+    elif diff == 0:
+        reconciled = True
     elif diff > 0 and log_res:
-        rejs = log_res[0]
-        dedups = log_res[1]
-        explanation = f"{dedups} duplicate scan events removed, {rejs} rows quarantined into rejects"
-    elif diff != 0:
+        rejs = log_res[0] or 0
+        dedups = log_res[1] or 0
+        if file_rows == (wh_rows + rejs + dedups):
+            reconciled = True
+            explanation = f"{dedups} duplicate scan events removed, {rejs} rows quarantined into rejects (Reconciliation verified)"
+        else:
+            explanation = f"Unreconciled gap: file ({file_rows}) != loaded ({wh_rows}) + rejects ({rejs}) + dedup ({dedups})"
+    else:
         explanation = f"Unreconciled gap of {diff} rows"
 
     return {
@@ -176,6 +180,7 @@ def reconcile(scan_date, eng=engine):
         "file_rows": file_rows,
         "warehouse_rows": wh_rows,
         "difference": diff,
+        "reconciled": reconciled,
         "explanation": explanation
     }
 
@@ -209,10 +214,19 @@ if __name__ == "__main__":
     print(f"File Rows: {rec['file_rows']} | Warehouse Rows: {rec['warehouse_rows']} | Difference: {rec['difference']}")
     print(f"Explanation: {rec['explanation']}")
 
-    # Exit code decision:
-    # If there are missing schema columns (drift like 19 May) fail with code 1
+    # 4. Exit Code Handling
+    total_violations = report["failed_rows"].sum()
+
     if missing_cols:
         print("\nQuality status: FAILED (Critical schema drift)")
+        sys.exit(1)
+
+    if not rec["reconciled"]:
+        print(f"\nQuality status: FAILED (Data reconciliation mismatch: {rec['explanation']})")
+        sys.exit(1)
+
+    if total_violations > 0:
+        print(f"\nQuality status: FAILED ({total_violations} total rule violations found across raw input)")
         sys.exit(1)
 
     print("\nQuality status: PASSED")
