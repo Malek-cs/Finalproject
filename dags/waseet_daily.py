@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime
 import os
 import pandas as pd
 from airflow import DAG
@@ -7,20 +7,16 @@ from airflow.operators.python import BranchPythonOperator
 from airflow.operators.bash import BashOperator
 from airflow.operators.empty import EmptyOperator
 
-DATA_DIR = "/opt/airflow/data"
+DATA_DIR = os.environ.get("WASEET_DATA_DIR", "/opt/airflow/data")
 
 def alert_failure(context):
-    dag_id = context.get('task_instance').dag_id
-    task_id = context.get('task_instance').task_id
-    execution_date = context.get('execution_date')
-    print(f"[CRITICAL ALERT] Task {task_id} failed in DAG {dag_id} on {execution_date}!")
+    ti = context.get('task_instance')
+    print(f"[CRITICAL ALERT] Task {ti.task_id} failed in DAG {ti.dag_id} on {context.get('execution_date')}!")
 
 def choose_branch(ds, **kwargs):
     file_path = f"{DATA_DIR}/scans_{ds}.csv"
     if not os.path.exists(file_path):
         return "skip_day"
-    
-    # Check if empty or only headers (e.g., Eid May 15)
     df = pd.read_csv(file_path, dtype=str)
     if df.empty or len(df) == 0:
         return "skip_day"
@@ -36,14 +32,12 @@ default_args = {
 with DAG(
     'waseet_daily',
     default_args=default_args,
-    description='Daily ingestion, transformation, and quality pipeline for Waseet',
     schedule_interval='@daily',
     start_date=datetime(2026, 5, 1),
     end_date=datetime(2026, 5, 21),
     catchup=False,
 ) as dag:
 
-    # 30s timeout so May 10 triggers failure callback quickly
     wait_for_file = FileSensor(
         task_id='wait_for_file',
         filepath=f"{DATA_DIR}/scans_{{{{ ds }}}}.csv",
@@ -60,12 +54,12 @@ with DAG(
 
     run_pipeline = BashOperator(
         task_id='run_pipeline',
-        bash_command='python /opt/airflow/pipeline/pipeline.py {{ ds }}',
+        bash_command='python /opt/airflow/pipeline/pipeline.py --date {{ ds }}',
     )
 
     run_quality = BashOperator(
         task_id='run_quality',
-        bash_command='python /opt/airflow/pipeline/quality.py {{ ds }}',
+        bash_command='python /opt/airflow/pipeline/quality.py --date {{ ds }}',
     )
 
     skip_day = EmptyOperator(
@@ -74,7 +68,7 @@ with DAG(
 
     finish = EmptyOperator(
         task_id='finish',
-        trigger_rule='none_failed_min_one_success',  # Allows successful DAG runs when skipping
+        trigger_rule='none_failed_min_one_success',
     )
 
     wait_for_file >> check_branch
